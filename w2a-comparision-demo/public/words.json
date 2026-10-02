@@ -1,0 +1,10 @@
+[
+  { "id": "1", "korean": "안녕하세요", "meaning": "Hello" },
+  { "id": "2", "korean": "감사합니다", "meaning": "Thank you" },
+  { "id": "3", "korean": "사랑", "meaning": "Love" },
+  { "id": "4", "korean": "친구", "meaning": "Friend" },
+  { "id": "5", "korean": "하늘", "meaning": "Sky" },
+  { "id": "6", "korean": "바다", "meaning": "Sea" },
+  { "id": "7", "korean": "학교", "meaning": "School" },
+  { "id": "8", "korean": "커피", "meaning": "Coffee" }
+]
