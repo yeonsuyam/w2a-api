@@ -14,6 +14,7 @@ another; both are cloned next to `server.py` and are not vendored here:
 git clone https://github.com/21jun/w2a-api.git && cd w2a-api
 git clone https://github.com/solee0022/wake2adapt.git   # ASR pipeline + L2-KPNS-jsonl (required)
 git clone https://github.com/21jun/w2a-demo.git         # browser demo (optional)
+git clone https://github.com/yeonsuyam/L2-KPNS.git ../L2-KPNS  # full entity CSVs
 
 uv venv --python 3.11 .venv
 VIRTUAL_ENV=.venv uv pip install -r requirements.txt
@@ -28,14 +29,17 @@ export HF_HOME=/path/with/room/for/21GB   # on the KAIST box: source ../env.sh
 .venv/bin/python server.py --port 8000                  # loads Qwen2.5-Omni-7B on cuda:0
 .venv/bin/python server.py --port 8000 --no-asr         # retriever only, no GPU
 .venv/bin/python server.py --port 8000 --device cuda:3 --top_k 10
+.venv/bin/python server.py --port 8000 \
+  --lexicon_csv_dir ../L2-KPNS/metadata/lexicons
 ```
 
 Useful flags: `--model_path` (default `Qwen/Qwen2.5-Omni-7B`, also `W2A_MODEL`), `--device`,
 `--dtype`, `--quant` (see below), `--max_new_tokens`, `--domains`, `--top_k`, `--repo_root`
 (default `./wake2adapt`),
-`--lexicon_csv_dir` (point it at `L2-KPNS/metadata/recording_targets` to use the official
-`{domain}_200.csv` lexicon; without it the 200 entities per domain are rebuilt from the
-`answer` fields in `wake2adapt/L2-KPNS-jsonl/`).
+The server automatically uses `../L2-KPNS/metadata/lexicons` (or `./L2-KPNS/metadata/lexicons`)
+when it exists. Use `--lexicon_csv_dir` or `W2A_LEXICON_DIR` when the checkout is elsewhere.
+The loader prefers the full `{domain}.csv` files, keeps their `entity_id` and `romanized`
+metadata, and falls back to the legacy `{domain}_200.csv` files or JSONL answers.
 
 ## VRAM and quantization
 
@@ -85,7 +89,8 @@ the offline pipeline.
 | `GET` | `/health` | model / device / lexicon sizes |
 | `GET` | `/lexicon?domain=roads&limit=20` | peek at the entity lexicon and its IPA |
 | `POST` | `/transcribe` | audio -> ASR -> top-k retrieval |
-| `POST` | `/retrieve` | text -> top-k retrieval (no GPU, for debugging the retriever) |
+| `POST` | `/retrieve` | text -> top-k retrieval (no GPU; the demo uses it as the second stage) |
+| `POST` | `/cancel` | form `request_id`: stop that `/transcribe` call at the next generated token |
 
 `/transcribe` is multipart form data:
 
@@ -96,6 +101,11 @@ the offline pipeline.
 | `top_k` | no | 10 | |
 | `ref_audio` | no | | 1-shot reference from the same speaker -> turns on ASR adaptation |
 | `ref_text` | no | `""` | the reference transcription that goes with `ref_audio` |
+| `request_id` | no | `""` | lets `POST /cancel` stop this call (answered with 409 `cancelled`) |
+| `with_retrieval` | no | `true` | `false`: ASR only, `retrieved` is empty |
+
+`/transcribe` runs in the threadpool with one ASR on the GPU at a time, so `/cancel` is
+answered while a transcription is running.
 
 ```bash
 # zero-shot
@@ -119,10 +129,10 @@ Response:
   "asr_adaptation": true,
   "domain": "roads",
   "top_k": 5,
-  "lexicon_size": 200,
+  "lexicon_size": 36927,
   "retrieved": [
-    {"rank": 1, "entity": "상곡안길", "score": 0.91, "distance": 1, "ipa": "saŋkokankil"},
-    {"rank": 2, "entity": "상고론길", "score": 0.73, "distance": 3, "ipa": "saŋkoronkil"}
+    {"rank": 1, "entity_id": "RD16245", "entity": "상곡안길", "romanized": "sang-gog-an-gil", "score": 0.91, "distance": 1, "ipa": "saŋkokankil"},
+    {"rank": 2, "entity_id": "RD16235", "entity": "상고론길", "romanized": "sang-go-ron-gil", "score": 0.73, "distance": 3, "ipa": "saŋkoronkil"}
   ],
   "retr_entities": ["상곡안길", "상고론길"],
   "audio": {"filename": "RD21899_P001.wav", "orig_sample_rate": 16000, "seconds": 1.8},

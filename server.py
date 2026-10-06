@@ -26,14 +26,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import heapq
 import importlib.util
 import io
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TypedDict
 
 import av
 import epitran
@@ -50,10 +52,24 @@ DOMAINS = ["roads", "content", "restaurants", "stations"]
 epi = epitran.Epitran("kor-Hang")
 dst = panphon.distance.Distance()
 
+
+class LexiconEntry(TypedDict):
+    entity_id: str
+    entity: str
+    romanized: str
+    ipa: str
+
+
 # filled in by main()
 CFG: "ServerConfig" = None
-LEXICON: Dict[str, Dict[str, str]] = {}   # domain -> {entity: ipa}
-ASR = None                                # Qwen25OmniASRPipeline, None with --no-asr
+LEXICON: Dict[str, Dict[str, LexiconEntry]] = {}  # domain -> {Korean entity: metadata}
+ASR = None                                       # Qwen25OmniASRPipeline, None with --no-asr
+
+# Cancellation: /transcribe runs in FastAPI's threadpool (plain `def`), so /cancel is served
+# while the GPU is busy. One ASR runs at a time; the running one checks CANCELLED per token.
+ASR_LOCK = threading.Lock()
+ACTIVE_REQUEST: Optional[str] = None
+CANCELLED: set = set()
 
 
 class ServerConfig:
@@ -81,38 +97,67 @@ def normalized_phoneme_editdistance(dist: float, utterance_ipa: str, entity_ipa:
     return 1 - (dist / max(len(utterance_ipa), len(entity_ipa), 1))
 
 
-def retrieve_top_k(utterance: str, entity_ipa: Dict[str, str], k: int = 10) -> Tuple[List[dict], str]:
+def retrieve_top_k(
+    utterance: str,
+    entities: Dict[str, LexiconEntry],
+    k: int = 10,
+) -> Tuple[List[dict], str]:
     """Top-k entities by phoneme-level edit distance against the ASR result."""
     utterance_ipa = epi.transliterate(utterance)
     scored = []
-    for entity, ipa in entity_ipa.items():
+    for position, entry in enumerate(entities.values()):
+        ipa = entry["ipa"]
         dist = int(dst.levenshtein_distance(utterance_ipa, ipa))  # panphon hands back np.int64
-        scored.append({
-            "entity": entity,
+        row = {
+            "entity_id": entry["entity_id"],
+            "entity": entry["entity"],
+            "romanized": entry["romanized"],
             "score": float(round(normalized_phoneme_editdistance(dist, utterance_ipa, ipa), 2)),
             "distance": dist,
             "ipa": ipa,
-        })
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    top = scored[:k]
+        }
+        if len(scored) < k:
+            heapq.heappush(scored, (row["score"], -position, row))
+        elif (row["score"], -position) > scored[0][:2]:
+            heapq.heapreplace(scored, (row["score"], -position, row))
+    top = [row for _, _, row in sorted(scored, reverse=True)]
     for rank, row in enumerate(top, start=1):
         row["rank"] = rank
     return top, utterance_ipa
 
 
-def load_lexicon(cfg: ServerConfig) -> Dict[str, Dict[str, str]]:
-    """domain -> {entity: ipa}. Prefers the L2-KPNS {domain}_200.csv lexicon when its directory
-    is given, otherwise rebuilds the 200 entities per domain from the answers in
-    L2-KPNS-jsonl (same set: 200 unique answers per domain)."""
-    lexicon: Dict[str, Dict[str, str]] = {}
+def load_lexicon(cfg: ServerConfig) -> Dict[str, Dict[str, LexiconEntry]]:
+    """Load full L2-KPNS CSV metadata, with the legacy 200-item data as a fallback."""
+    lexicon: Dict[str, Dict[str, LexiconEntry]] = {}
     for domain in cfg.domains:
-        names: List[str] = []
-        csv_path = cfg.lexicon_csv_dir / f"{domain}_200.csv" if cfg.lexicon_csv_dir else None
+        csv_path = None
+        if cfg.lexicon_csv_dir:
+            for filename in (f"{domain}.csv", f"{domain}_200.csv"):
+                candidate = cfg.lexicon_csv_dir / filename
+                if candidate.exists():
+                    csv_path = candidate
+                    break
+
+        table: Dict[str, LexiconEntry] = {}
         if csv_path and csv_path.exists():
             with open(csv_path, encoding="utf-8-sig") as f:
-                names = [row["korean"] for row in csv.DictReader(f)]
+                reader = csv.DictReader(f)
+                if not reader.fieldnames or "korean" not in reader.fieldnames:
+                    raise ValueError(f"lexicon CSV needs a korean column: {csv_path}")
+                for row in reader:
+                    entity = (row.get("korean") or "").strip()
+                    if not entity or entity in table:
+                        continue
+                    table[entity] = {
+                        "entity_id": (row.get("entity_id") or "").strip(),
+                        "entity": entity,
+                        "romanized": (row.get("romanized") or "").strip(),
+                        "ipa": (row.get("phonemes") or "").strip()
+                        or epi.transliterate(entity),
+                    }
             source = str(csv_path)
         else:
+            names: List[str] = []
             for path in sorted(cfg.jsonl_dir.glob(f"*/{domain}_*.jsonl")):
                 with open(path, encoding="utf-8") as f:
                     for line in f:
@@ -120,19 +165,26 @@ def load_lexicon(cfg: ServerConfig) -> Dict[str, Dict[str, str]]:
                         if line:
                             names.append(json.loads(line)["answer"])
             source = f"{cfg.jsonl_dir}/*/{domain}_*.jsonl"
-        names = list(dict.fromkeys(names))  # dedupe, preserve order
-        if not names:
+            for entity in dict.fromkeys(names):
+                table[entity] = {
+                    "entity_id": "",
+                    "entity": entity,
+                    "romanized": "",
+                    "ipa": epi.transliterate(entity),
+                }
+
+        if not table:
             print(f"[warn] no entities found for domain={domain} ({source})")
             continue
-        lexicon[domain] = {e: epi.transliterate(e) for e in names}
-        print(f"[lexicon] {domain}: {len(names)} entities from {source}")
+        lexicon[domain] = table
+        print(f"[lexicon] {domain}: {len(table)} entities from {source}")
     return lexicon
 
 
-def entity_ipa_for(domain: str) -> Dict[str, str]:
+def entity_ipa_for(domain: str) -> Dict[str, LexiconEntry]:
     """A single domain, or every domain merged when domain == 'all'."""
     if domain == "all":
-        merged: Dict[str, str] = {}
+        merged: Dict[str, LexiconEntry] = {}
         for table in LEXICON.values():
             merged.update(table)
         return merged
@@ -210,9 +262,34 @@ def load_asr(cfg: ServerConfig):
     if not cfg.keep_visual:
         pipeline.model.thinker.visual = None  # 1.26 GiB vision tower, unused for audio-only ASR
         torch.cuda.empty_cache()
+    install_cancellation(pipeline)
     allocated = torch.cuda.memory_allocated(cfg.device) / 2**30 if torch.cuda.is_available() else 0
     print(f"[asr] ready ({allocated:.2f} GiB allocated)")
     return pipeline
+
+
+def install_cancellation(pipeline) -> None:
+    """Make every thinker.generate() stop at the next token once the active request is cancelled.
+
+    Wraps the instance method so wake2adapt's code stays untouched; Qwen2.5-Omni's generate()
+    forwards its kwargs to thinker.generate()."""
+    import torch
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class CancelCriteria(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs):
+            stop = ACTIVE_REQUEST is not None and ACTIVE_REQUEST in CANCELLED
+            return torch.full((input_ids.shape[0],), stop, dtype=torch.bool, device=input_ids.device)
+
+    thinker = pipeline.model.thinker
+    original_generate = thinker.generate
+
+    def generate(*args, **kwargs):
+        criteria = StoppingCriteriaList(kwargs.pop("stopping_criteria", None) or [])
+        criteria.append(CancelCriteria())
+        return original_generate(*args, stopping_criteria=criteria, **kwargs)
+
+    thinker.generate = generate
 
 
 def decode_with_av(raw: bytes) -> Tuple[np.ndarray, int]:
@@ -279,7 +356,7 @@ def health():
 @app.get("/lexicon")
 def lexicon(domain: str = "roads", limit: int = 20):
     table = entity_ipa_for(domain)
-    items = [{"entity": e, "ipa": ipa} for e, ipa in list(table.items())[:limit]]
+    items = list(table.values())[:limit]
     return {"domain": domain, "size": len(table), "items": items}
 
 
@@ -300,31 +377,57 @@ def retrieve(text: str = Form(...), domain: str = Form("roads"), top_k: Optional
     }
 
 
+@app.post("/cancel")
+def cancel(request_id: str = Form(...)):
+    """Stop the /transcribe call sent with this request_id (running or still waiting)."""
+    if len(CANCELLED) > 1000:
+        CANCELLED.clear()
+    CANCELLED.add(request_id)
+    return {"request_id": request_id, "was_running": ACTIVE_REQUEST == request_id}
+
+
 @app.post("/transcribe")
-async def transcribe(
+def transcribe(
     audio: UploadFile = File(..., description="audio to transcribe (wav/flac/mp3/...)"),
     domain: str = Form("roads"),
     top_k: Optional[int] = Form(None),
     ref_audio: Optional[UploadFile] = File(None, description="1-shot reference audio (same speaker)"),
     ref_text: str = Form(""),
+    request_id: str = Form("", description="id that POST /cancel can stop"),
+    with_retrieval: bool = Form(True, description="false: ASR only (use /retrieve after)"),
 ):
     """ASR (zero-shot, or 1-shot adaptation when ref_audio is sent) + phonetic retrieval."""
+    global ACTIVE_REQUEST
     if ASR is None:
         raise HTTPException(503, "server started with --no-asr; only /retrieve is available")
     k = top_k or CFG.top_k
-    entity_ipa = entity_ipa_for(domain)
+    entities = entity_ipa_for(domain)
 
     t0 = time.perf_counter()
-    wav, orig_sr = decode_audio(await audio.read(), audio.filename or "audio")
+    wav, orig_sr = decode_audio(audio.file.read(), audio.filename or "audio")
     ref_wav = None
     if ref_audio is not None and ref_audio.filename:
-        ref_wav, _ = decode_audio(await ref_audio.read(), ref_audio.filename)
+        ref_wav, _ = decode_audio(ref_audio.file.read(), ref_audio.filename)
     t_decode = time.perf_counter()
 
-    asr_result = ASR.run_asr(audio=wav, ref_audio=ref_wav, reference_text=ref_text)
+    with ASR_LOCK:  # one generate() on the GPU at a time
+        if request_id and request_id in CANCELLED:
+            CANCELLED.discard(request_id)
+            raise HTTPException(409, "cancelled")
+        ACTIVE_REQUEST = request_id or None
+        try:
+            asr_result = ASR.run_asr(audio=wav, ref_audio=ref_wav, reference_text=ref_text)
+        finally:
+            ACTIVE_REQUEST = None
+    if request_id and request_id in CANCELLED:
+        CANCELLED.discard(request_id)
+        raise HTTPException(409, "cancelled")
     t_asr = time.perf_counter()
 
-    hits, asr_ipa = retrieve_top_k(asr_result, entity_ipa, k=k)
+    if with_retrieval:
+        hits, asr_ipa = retrieve_top_k(asr_result, entities, k=k)
+    else:
+        hits, asr_ipa = [], epi.transliterate(asr_result)
     t_end = time.perf_counter()
 
     return {
@@ -334,7 +437,7 @@ async def transcribe(
         "ref_text": ref_text,
         "domain": domain,
         "top_k": k,
-        "lexicon_size": len(entity_ipa),
+        "lexicon_size": len(entities),
         "retrieved": hits,
         "retr_entities": [h["entity"] for h in hits],
         "audio": {
@@ -405,7 +508,19 @@ def index():
 
 def main():
     global CFG, LEXICON, ASR
-    default_repo = Path(__file__).resolve().parent / "wake2adapt"
+    server_root = Path(__file__).resolve().parent
+    default_repo = server_root / "wake2adapt"
+    default_lexicon_dir = next(
+        (
+            path
+            for path in (
+                server_root / "L2-KPNS" / "metadata" / "lexicons",
+                server_root.parent / "L2-KPNS" / "metadata" / "lexicons",
+            )
+            if path.is_dir()
+        ),
+        None,
+    )
 
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -414,9 +529,13 @@ def main():
     p.add_argument("--repo_root", default=os.environ.get("W2A_REPO", str(default_repo)),
                    help="wake2adapt checkout (default: ./wake2adapt next to this file)")
     p.add_argument("--jsonl_dir", default=None, help="default: {repo_root}/L2-KPNS-jsonl")
-    p.add_argument("--lexicon_csv_dir", default=None,
-                   help="directory holding the L2-KPNS {domain}_200.csv files; "
-                        "falls back to the answers in the jsonl files")
+    p.add_argument("--lexicon_csv_dir",
+                   default=os.environ.get(
+                       "W2A_LEXICON_DIR",
+                       str(default_lexicon_dir) if default_lexicon_dir else None,
+                   ),
+                   help="directory holding the full L2-KPNS {domain}.csv files; "
+                        "falls back to {domain}_200.csv, then the JSONL answers")
     p.add_argument("--domains", default=",".join(DOMAINS))
     p.add_argument("--model_path", default=os.environ.get("W2A_MODEL", "Qwen/Qwen2.5-Omni-7B"))
     p.add_argument("--device", default="cuda:0")
